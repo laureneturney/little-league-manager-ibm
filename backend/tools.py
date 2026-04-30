@@ -54,6 +54,42 @@ def get_standby_players(data: LeagueData, team_id: str) -> List[str]:
     return get_team_roster(data, team_id)["standby"]
 
 
+def resolve_team_id(data: LeagueData, query: str) -> Optional[str]:
+    """Best-effort team lookup from name or ID. Case-insensitive."""
+    if not query:
+        return None
+    q = str(query).strip().lower()
+    for tid, name in data.teams.items():
+        if q == tid.lower() or q == name.lower():
+            return tid
+    for tid, name in data.teams.items():
+        if q in name.lower() or name.lower() in q:
+            return tid
+    return None
+
+
+def get_team_matches(
+    data: LeagueData, team_id: str,
+    today: Optional[str] = None, limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Matches for a team, future-only when `today` is given. Up to `limit` rows."""
+    tid = resolve_team_id(data, team_id) or team_id
+    df = data.matches[
+        (data.matches["HomeTeamID"] == tid) | (data.matches["AwayTeamID"] == tid)
+    ]
+    if today:
+        today_dt = datetime.strptime(today, "%Y-%m-%d")
+        df = df[df["StartDT"] >= today_dt]
+    df = df.sort_values("StartDT").head(int(limit))
+    return [_match_to_dict(data, r) for _, r in df.iterrows()]
+
+
+def get_standings(data: LeagueData, today: str, top: int = 12) -> List[Dict[str, Any]]:
+    """League standings (W/L/T/PTS) computed from matches whose date < today."""
+    from .standings import standings_table  # local import to avoid cycles
+    return standings_table(data, today)[: int(top)]
+
+
 # ------------------------------------------------------------------
 # Validators (return structured Alert dicts)
 # ------------------------------------------------------------------
@@ -595,13 +631,14 @@ def build_tool_registry(
         "get_upcoming_matches": lambda today, days=14: get_upcoming_matches(data, today, days),
         "get_match_details": lambda match_id: get_match_details(data, match_id),
         "get_team_roster": lambda team_id: get_team_roster(data, team_id),
+        "get_team_matches": lambda team_id, today=None, limit=5: get_team_matches(data, team_id, today, limit),
+        "get_standings": lambda today, top=12: get_standings(data, today, top),
         "get_standby_players": lambda team_id: get_standby_players(data, team_id),
         "check_field_conflicts": lambda today: check_field_conflicts(data, today),
         "check_referee_conflicts": lambda today: check_referee_conflicts(data, today),
         "check_roster_shortage": lambda today: check_roster_shortage(data, today),
         "check_rematch_violations": lambda today: check_rematch_violations(data, today),
         "check_weekly_game_limit": lambda today: check_weekly_game_limit(data, today),
-        "check_home_away_balance": lambda: check_home_away_balance(data),
         "check_weather_alerts": _check_weather,
         "get_available_fields": lambda date, time_start: get_available_fields(data, date, time_start),
         "get_available_referees": lambda date, time_start: get_available_referees(data, date, time_start),
@@ -613,20 +650,40 @@ def build_tool_registry(
 
 
 TOOL_DESCRIPTIONS = [
-    {"name": "get_upcoming_matches", "args": ["today (YYYY-MM-DD)", "days (int, default 14)"],
-     "doc": "List matches scheduled within `days` from today."},
-    {"name": "get_match_details", "args": ["match_id"], "doc": "Full record for a single match."},
-    {"name": "get_team_roster", "args": ["team_id"], "doc": "Starters, standby list, and total players."},
-    {"name": "get_standby_players", "args": ["team_id"], "doc": "Standby/substitute players for a team."},
-    {"name": "check_field_conflicts", "args": ["today"], "doc": "Find double-booked fields."},
-    {"name": "check_referee_conflicts", "args": ["today"], "doc": "Find double-booked referees."},
-    {"name": "check_roster_shortage", "args": ["today"], "doc": "Find teams below the 9-player minimum."},
-    {"name": "check_rematch_violations", "args": ["today"], "doc": "Pairs scheduled more than 2 times."},
-    {"name": "check_weekly_game_limit", "args": ["today"], "doc": "Teams with more than 2 games in a week."},
-    {"name": "check_home_away_balance", "args": [], "doc": "Teams whose home/away spread is too wide."},
-    {"name": "check_weather_alerts", "args": ["today", "days"], "doc": "Weather-driven reschedule alerts."},
-    {"name": "get_available_fields", "args": ["date", "time_start"], "doc": "Free fields in a slot."},
-    {"name": "get_available_referees", "args": ["date", "time_start"], "doc": "Free referees in a slot."},
-    {"name": "suggest_reschedule", "args": ["match_id", "today"],
+    {"name": "get_upcoming_matches",
+     "args": {"today": "YYYY-MM-DD", "days": "int (default 14)"},
+     "doc": "List ALL matches scheduled within `days` from today."},
+    {"name": "get_match_details",
+     "args": {"match_id": "string e.g. 'M1377'"},
+     "doc": "Full record for a single match by ID."},
+    {"name": "get_team_roster",
+     "args": {"team_id": "string e.g. 'T07' or team name e.g. 'Dragons'"},
+     "doc": "Starters, standby list, and total players for a team."},
+    {"name": "get_team_matches",
+     "args": {"team_id": "string", "today": "YYYY-MM-DD (optional)", "limit": "int (default 5)"},
+     "doc": "Matches involving a specific team. With `today` set, returns ONLY upcoming matches. Use this when the user asks 'when does team X play next?'."},
+    {"name": "get_standings",
+     "args": {"today": "YYYY-MM-DD"},
+     "doc": "League standings: W/L/T/PTS for every team, ranked. Use this for 'who is leading?' / 'show standings'."},
+    {"name": "get_standby_players",
+     "args": {"team_id": "string"},
+     "doc": "Standby/substitute players (the bench) for a team."},
+    {"name": "check_field_conflicts", "args": {"today": "YYYY-MM-DD"},
+     "doc": "Find double-booked fields with reassignment suggestions."},
+    {"name": "check_referee_conflicts", "args": {"today": "YYYY-MM-DD"},
+     "doc": "Find double-booked referees with reassignment suggestions."},
+    {"name": "check_roster_shortage", "args": {"today": "YYYY-MM-DD"},
+     "doc": "Find teams below the 9-player minimum with call-up suggestions."},
+    {"name": "check_rematch_violations", "args": {"today": "YYYY-MM-DD"},
+     "doc": "Pairs scheduled to play each other too often (only when rule is enabled)."},
+    {"name": "check_weekly_game_limit", "args": {"today": "YYYY-MM-DD"},
+     "doc": "Teams with too many games in a week (only when rule is enabled)."},
+    {"name": "check_weather_alerts", "args": {"today": "YYYY-MM-DD", "days": "int (default 14)"},
+     "doc": "Weather-driven reschedule alerts, one per severe day."},
+    {"name": "get_available_fields", "args": {"date": "YYYY-MM-DD", "time_start": "e.g. '05:00 pm'"},
+     "doc": "Free fields in a given slot."},
+    {"name": "get_available_referees", "args": {"date": "YYYY-MM-DD", "time_start": "e.g. '05:00 pm'"},
+     "doc": "Free referees in a given slot."},
+    {"name": "suggest_reschedule", "args": {"match_id": "string", "today": "YYYY-MM-DD"},
      "doc": "Concrete reschedule proposal: date, time, field, referee."},
 ]

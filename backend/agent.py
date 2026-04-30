@@ -66,26 +66,56 @@ class DiagnosticsReport:
         return asdict(self)
 
 
-SYSTEM_PROMPT = """You are the Little League Manager — an autonomous scheduling \
-agent for a youth sports league. You monitor field availability, referee \
-assignments, rosters (9-player minimum), and weather. When you find a problem, \
-you propose a SPECIFIC, actionable resolution: a Field number, a time slot, or \
-a Referee name. Your suggestions will be ingested by a UI, so always be concrete.
+SYSTEM_PROMPT_TEMPLATE = """You are the Little League Manager — an autonomous \
+scheduling agent for a youth sports league. Answer the league coordinator's \
+questions using ONLY the GROUND-TRUTH FACTS and the TOOLS below. Never invent \
+team names, players, fields, or referees.
 
-You may call tools to query the league database. Respond with ONE JSON object \
-on each turn, in one of these two shapes:
+GROUND-TRUTH FACTS (always accurate, do not contradict):
+- Today's date: {today}
+- League location: {location}
+- Teams (12 total): {teams}
+- Fields (3 total): {fields}
+- Referees (8 total): {referees}
+- Roster minimum is 9 players; below that the team forfeits.
 
-  {"tool": "<tool_name>", "args": { ... }}             # call a tool
-  {"final_answer": "<plain-text answer for the user>"}  # finish
+TOOLS available to you:
+{tools}
 
-Available tools:
-%s
+INTERACTION FORMAT — STRICT:
+On every turn, output EXACTLY ONE JSON object. Nothing else. No prose, no \
+markdown, no code fences. The two valid shapes are:
 
-Rules:
-- Always cite specific Match IDs, Field IDs (F01..F03), Referee IDs (R01..R08), \
-and exact times.
-- Stop and emit `final_answer` as soon as you have enough information.
-- Never invent data. If a tool returns nothing, say so.
+  {{"tool": "<tool_name>", "args": {{ "<arg>": <value>, ... }}}}
+  {{"final_answer": "<plain text for the user>"}}
+
+NEVER emit two JSON objects in one turn. NEVER call a tool and provide a \
+final_answer in the same response.
+
+Workflow:
+1. If the user's question is fully answered by the GROUND-TRUTH FACTS \
+(e.g., "what teams are in the league?"), reply with a final_answer immediately.
+2. Otherwise call ONE tool, observe its result on the next turn, then either \
+call another tool or emit a final_answer.
+3. Use real values from the ground-truth list — e.g., the Dragons are T07, \
+not "All-Stars" or "Cardinals". Field IDs are F01..F03 only. Referee IDs are \
+R01..R08 only.
+4. Cite specific Match IDs, dates, and times when answering scheduling questions.
+
+EXAMPLES:
+
+User: What teams are in the league?
+You: {{"final_answer": "The 12 teams are Strikers (T01), Titans (T02), Eagles (T03), Thunder (T04), United (T05), Wolves (T06), Dragons (T07), Lions (T08), Hawks (T09), Blazers (T10), Cobras (T11), and Storm (T12)."}}
+
+User: When do the Dragons play next?
+You: {{"tool": "get_team_matches", "args": {{"team_id": "T07", "today": "{today}", "limit": 1}}}}
+[tool result observed]
+You: {{"final_answer": "The Dragons (T07) play next on 2026-04-25 at 1:00pm vs the Hawks (T09) on Field 3, refereed by Karen Davis."}}
+
+User: Who is leading the league?
+You: {{"tool": "get_standings", "args": {{"today": "{today}"}}}}
+[tool result observed]
+You: {{"final_answer": "The Dragons (T07) are leading with 35-23-6 (111 points), followed by the Cobras (T11) at 31-23-10."}}
 """
 
 
@@ -109,7 +139,6 @@ class LeagueManagerAgent:
         }
         self.tools = build_tool_registry(data, weather_provider=self.weather, location=self._location)
         self.max_steps = max_steps
-        self.system_prompt = SYSTEM_PROMPT % json.dumps(TOOL_DESCRIPTIONS, indent=2)
 
     # ------------------------------------------------------------------
     # Runtime configuration
@@ -165,39 +194,86 @@ class LeagueManagerAgent:
         return self._llm_chat(user_message, today)
 
     def _llm_chat(self, user_message: str, today: str) -> Dict[str, Any]:
-        scratchpad = [f"Today is {today}.", f"User question: {user_message}", ""]
+        system_prompt = self._build_system_prompt(today)
+        scratchpad = [f"User question: {user_message}", ""]
         trace: List[Dict[str, Any]] = []
+        consecutive_parse_failures = 0
+
         for step in range(self.max_steps):
-            response = self.llm.complete(self.system_prompt, "\n".join(scratchpad))
-            parsed = self._parse_json(response)
+            response = self.llm.complete(system_prompt, "\n".join(scratchpad))
+            parsed = self._parse_first_json(response)
+
             if not parsed:
-                return {
-                    "answer": (
-                        "The agent's response could not be parsed. Raw output:\n\n"
-                        + response
-                    ),
-                    "trace": trace,
-                    "provider": self.llm.name,
-                }
-            if "final_answer" in parsed:
+                consecutive_parse_failures += 1
+                if consecutive_parse_failures >= 2:
+                    # Bail out and use the deterministic responder.
+                    fallback = self._mock_chat(user_message, today)
+                    fallback["trace"] = trace
+                    fallback["provider"] = self.llm.name + " (fallback to rules)"
+                    return fallback
+                scratchpad.append(
+                    "Your previous output could not be parsed as JSON. Output "
+                    "EXACTLY ONE JSON object — no prose, no markdown, no fences."
+                )
+                continue
+            consecutive_parse_failures = 0
+
+            if "final_answer" in parsed and "tool" not in parsed:
                 return {"answer": parsed["final_answer"], "trace": trace, "provider": self.llm.name}
+
             tool = parsed.get("tool")
             args = parsed.get("args", {}) or {}
             if tool not in self.tools:
-                scratchpad.append(f"Tool `{tool}` not found. Available: {list(self.tools)}")
+                scratchpad.append(
+                    f"Tool `{tool}` does not exist. Choose from: {sorted(self.tools)}"
+                )
                 continue
+
+            # Accept both list (positional) and dict (keyword) args.
             try:
-                result = self.tools[tool](**args)
+                if isinstance(args, list):
+                    result = self.tools[tool](*args)
+                elif isinstance(args, dict):
+                    result = self.tools[tool](**args)
+                else:
+                    result = self.tools[tool]()
             except TypeError as e:
-                scratchpad.append(f"Tool `{tool}` argument error: {e}")
+                scratchpad.append(f"Tool `{tool}` argument error: {e}. Re-issue the call with correct args.")
                 continue
-            trace.append({"step": step + 1, "tool": tool, "args": args, "result_preview": _preview(result)})
-            scratchpad.append(f"Tool `{tool}` returned: {json.dumps(result, default=str)[:1500]}")
-        return {
-            "answer": "Reached step limit before producing a final answer. Tool trace below.",
-            "trace": trace,
-            "provider": self.llm.name,
-        }
+            except Exception as e:  # noqa: BLE001
+                scratchpad.append(f"Tool `{tool}` failed: {e}. Try a different approach.")
+                continue
+
+            trace.append({
+                "step": step + 1, "tool": tool, "args": args,
+                "result_preview": _preview(result),
+            })
+            scratchpad.append(
+                f"Result of `{tool}`: {json.dumps(result, default=str)[:1500]}\n\n"
+                f"Now produce ONE JSON object: either another tool call OR a final_answer "
+                f"that answers the user's question using this result."
+            )
+
+        # Step limit hit — fall back to rules so the user sees a useful answer.
+        fallback = self._mock_chat(user_message, today)
+        fallback["trace"] = trace
+        fallback["provider"] = self.llm.name + " (fallback to rules)"
+        return fallback
+
+    def _build_system_prompt(self, today: str) -> str:
+        teams = ", ".join(f"{tid} {name}" for tid, name in sorted(self.data.teams.items()))
+        fields = ", ".join(f"{fid} ({name})" for fid, name in sorted(self.data.field_names.items()))
+        referees = ", ".join(f"{rid} ({name})" for rid, name in sorted(self.data.referee_names.items()))
+        location = self._location.get("city") or "(not set)"
+        tools_doc = json.dumps(TOOL_DESCRIPTIONS, indent=2)
+        return SYSTEM_PROMPT_TEMPLATE.format(
+            today=today,
+            location=location,
+            teams=teams,
+            fields=fields,
+            referees=referees,
+            tools=tools_doc,
+        )
 
     def _mock_chat(self, user_message: str, today: str) -> Dict[str, Any]:
         """Deterministic responder used when no LLM is configured."""
@@ -255,22 +331,50 @@ class LeagueManagerAgent:
         }
 
     @staticmethod
-    def _parse_json(text: str) -> Dict[str, Any] | None:
-        """Tolerant JSON extraction — LLMs love to wrap JSON in prose / fences."""
-        text = text.strip()
-        # Strip ```json ... ``` fences if present
-        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if fence:
-            text = fence.group(1)
-        # Otherwise grab first { ... } block
-        else:
-            brace = re.search(r"\{.*\}", text, re.DOTALL)
-            if brace:
-                text = brace.group(0)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
+    def _parse_first_json(text: str) -> Dict[str, Any] | None:
+        """Return the first balanced + parseable {...} object found in `text`.
+
+        Robust to multiple objects (`{...} {...}`), code fences, prose around
+        the object, and braces inside string values. Quote/escape-aware brace
+        counting — a previous regex-based version would greedily span across
+        multiple objects and fail to parse.
+        """
+        if not text:
             return None
+        # Drop leading whitespace and obvious code fences
+        stripped = text.strip()
+        fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", stripped, re.DOTALL)
+        if fence:
+            stripped = fence.group(1)
+
+        depth = 0
+        start: int | None = None
+        in_string = False
+        escape = False
+        for i, ch in enumerate(stripped):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}" and depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidate = stripped[start: i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        start = None  # try the next object
+        return None
 
 
 # ----------------------------------------------------------------------
